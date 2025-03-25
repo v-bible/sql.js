@@ -5,19 +5,15 @@
     _malloc
     _free
     getValue
-    intArrayFromString
     setValue
     stackAlloc
     stackRestore
     stackSave
     UTF8ToString
-    stringToUTF8
-    lengthBytesUTF8
-    allocate
-    ALLOC_NORMAL
-    allocateUTF8OnStack
+    stringToNewUTF8
     removeFunction
     addFunction
+    writeArrayToMemory
 */
 
 "use strict";
@@ -71,6 +67,10 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
     var SQLITE_BLOB = 4;
     // var - Encodings, used for registering functions.
     var SQLITE_UTF8 = 1;
+    // var - Authorizer Action Codes used to identify change types in updateHook
+    var SQLITE_INSERT = 18;
+    var SQLITE_UPDATE = 23;
+    var SQLITE_DELETE = 9;
     // var - cwrap function
     var sqlite3_open = cwrap("sqlite3_open", "number", ["string", "number"]);
     var sqlite3_close_v2 = cwrap("sqlite3_close_v2", "number", ["number"]);
@@ -237,6 +237,12 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         "RegisterExtensionFunctions",
         "number",
         ["number"]
+    );
+
+    var sqlite3_update_hook = cwrap(
+        "sqlite3_update_hook",
+        "number",
+        ["number", "number", "number"]
     );
 
     /**
@@ -535,14 +541,13 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             pos = this.pos;
             this.pos += 1;
         }
-        var bytes = intArrayFromString(string);
-        var strptr = allocate(bytes, ALLOC_NORMAL);
+        var strptr = stringToNewUTF8(string);
         this.allocatedmem.push(strptr);
         this.db.handleError(sqlite3_bind_text(
             this.stmt,
             pos,
             strptr,
-            bytes.length - 1,
+            -1,
             0
         ));
         return true;
@@ -553,7 +558,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             pos = this.pos;
             this.pos += 1;
         }
-        var blobptr = allocate(array, ALLOC_NORMAL);
+        var blobptr = _malloc(array.length);
+        writeArrayToMemory(array, blobptr);
         this.allocatedmem.push(blobptr);
         this.db.handleError(sqlite3_bind_blob(
             this.stmt,
@@ -724,12 +730,10 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
      */
     function StatementIterator(sql, db) {
         this.db = db;
-        var sz = lengthBytesUTF8(sql) + 1;
-        this.sqlPtr = _malloc(sz);
+        this.sqlPtr = stringToNewUTF8(sql);
         if (this.sqlPtr === null) {
             throw new Error("Unable to allocate memory for the SQL string");
         }
-        stringToUTF8(sql, this.sqlPtr, sz);
         this.nextSqlPtr = this.sqlPtr;
         this.nextSqlString = null;
         this.activeStatement = null;
@@ -942,25 +946,27 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         if (!this.db) {
             throw "Database closed";
         }
-        var stack = stackSave();
         var stmt = null;
+        var originalSqlPtr = null;
+        var currentSqlPtr = null;
         try {
-            var nextSqlPtr = allocateUTF8OnStack(sql);
+            originalSqlPtr = stringToNewUTF8(sql);
+            currentSqlPtr = originalSqlPtr;
             var pzTail = stackAlloc(4);
             var results = [];
-            while (getValue(nextSqlPtr, "i8") !== NULL) {
+            while (getValue(currentSqlPtr, "i8") !== NULL) {
                 setValue(apiTemp, 0, "i32");
                 setValue(pzTail, 0, "i32");
                 this.handleError(sqlite3_prepare_v2_sqlptr(
                     this.db,
-                    nextSqlPtr,
+                    currentSqlPtr,
                     -1,
                     apiTemp,
                     pzTail
                 ));
                 // pointer to a statement, or null
                 var pStmt = getValue(apiTemp, "i32");
-                nextSqlPtr = getValue(pzTail, "i32");
+                currentSqlPtr = getValue(pzTail, "i32");
                 // Empty statement
                 if (pStmt !== NULL) {
                     var curresult = null;
@@ -986,7 +992,7 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
             if (stmt) stmt["free"]();
             throw errCaught;
         } finally {
-            stackRestore(stack);
+            if (originalSqlPtr) _free(originalSqlPtr);
         }
     };
 
@@ -1114,6 +1120,12 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         });
         Object.values(this.functions).forEach(removeFunction);
         this.functions = {};
+
+        if (this.updateHookFunctionPtr) {
+            removeFunction(this.updateHookFunctionPtr);
+            this.updateHookFunctionPtr = undefined;
+        }
+
         this.handleError(sqlite3_close_v2(this.db));
         FS.unlink("/" + this.filename);
         this.db = null;
@@ -1188,7 +1200,8 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
                 if (result === null) {
                     sqlite3_result_null(cx);
                 } else if (result.length != null) {
-                    var blobptr = allocate(result, ALLOC_NORMAL);
+                    var blobptr = _malloc(result.length);
+                    writeArrayToMemory(result, blobptr);
                     sqlite3_result_blob(cx, blobptr, result.length, -1);
                     _free(blobptr);
                 } else {
@@ -1382,6 +1395,143 @@ Module["onRuntimeInitialized"] = function onRuntimeInitialized() {
         ));
         return this;
     };
+
+    /** Registers an update hook with SQLite.
+     *
+     * Every time a row is changed by whatever means, the callback is called
+     * once with the change (`'insert'`, `'update'` or `'delete'`), the database
+     * name and table name where the change happened and the
+     * [rowid](https://www.sqlite.org/rowidtable.html)
+     * of the row that has been changed.
+     *
+     * The rowid is cast to a plain number. If it exceeds
+     * `Number.MAX_SAFE_INTEGER` (2^53 - 1), an error will be thrown.
+     *
+     * **Important notes:**
+     * - The callback **MUST NOT** modify the database in any way
+     * - Only a single callback can be registered at a time
+     * - Unregister the callback by passing `null`
+     * - Not called for some updates like `ON REPLACE CONFLICT` and `TRUNCATE`
+     *   (a `DELETE FROM` without a `WHERE` clause)
+     *
+     * See SQLite documentation on
+     * [sqlite3_update_hook](https://www.sqlite.org/c3ref/update_hook.html)
+     * for more details
+     *
+     * @example
+     * // Create a database and table
+     * var db = new SQL.Database();
+     * db.exec(`
+     * CREATE TABLE users (
+     *   id INTEGER PRIMARY KEY, -- this is the rowid column
+     *   name TEXT,
+     *   active INTEGER
+     * )
+     * `);
+     *
+     * // Register an update hook
+     * var changes = [];
+     * db.updateHook(function(operation, database, table, rowId) {
+     *   changes.push({operation, database, table, rowId});
+     *   console.log(`${operation} on ${database}.${table} row ${rowId}`);
+     * });
+     *
+     * // Insert a row - triggers the update hook with 'insert'
+     * db.run("INSERT INTO users VALUES (1, 'Alice', 1)");
+     * // Logs: "insert on main.users row 1"
+     *
+     * // Update a row - triggers the update hook with 'update'
+     * db.run("UPDATE users SET active = 0 WHERE id = 1");
+     * // Logs: "update on main.users row 1"
+     *
+     * // Delete a row - triggers the update hook with 'delete'
+     * db.run("DELETE FROM users WHERE id = 1");
+     * // Logs: "delete on main.users row 1"
+     *
+     * // Unregister the update hook
+     * db.updateHook(null);
+     *
+     * // This won't trigger any callback
+     * db.run("INSERT INTO users VALUES (2, 'Bob', 1)");
+     *
+     * @param {Database~UpdateHookCallback|null} callback
+     * - Callback to be executed when a row changes. Takes the type of change,
+     *   the name of the database, the name of the table, and the row id of the
+     *   changed row.
+     * - Set to `null` to unregister.
+     * @returns {Database} The database object. Useful for method chaining
+     */
+    Database.prototype["updateHook"] = function updateHook(callback) {
+        if (this.updateHookFunctionPtr) {
+            // unregister and cleanup a previously registered update hook
+            sqlite3_update_hook(this.db, 0, 0);
+            removeFunction(this.updateHookFunctionPtr);
+            this.updateHookFunctionPtr = undefined;
+        }
+
+        if (!callback) {
+            // no new callback to register
+            return this;
+        }
+
+        // void(*)(void *,int ,char const *,char const *,sqlite3_int64)
+        function wrappedCallback(
+            ignored,
+            operationCode,
+            databaseNamePtr,
+            tableNamePtr,
+            rowIdBigInt
+        ) {
+            var operation;
+
+            switch (operationCode) {
+                case SQLITE_INSERT:
+                    operation = "insert";
+                    break;
+                case SQLITE_UPDATE:
+                    operation = "update";
+                    break;
+                case SQLITE_DELETE:
+                    operation = "delete";
+                    break;
+                default:
+                    throw "unknown operationCode in updateHook callback: "
+                        + operationCode;
+            }
+
+            var databaseName = UTF8ToString(databaseNamePtr);
+            var tableName = UTF8ToString(tableNamePtr);
+
+            if (rowIdBigInt > Number.MAX_SAFE_INTEGER) {
+                throw "rowId too big to fit inside a Number";
+            }
+
+            var rowId = Number(rowIdBigInt);
+
+            callback(operation, databaseName, tableName, rowId);
+        }
+
+        this.updateHookFunctionPtr = addFunction(wrappedCallback, "viiiij");
+
+        sqlite3_update_hook(
+            this.db,
+            this.updateHookFunctionPtr,
+            0 // passed as the first arg to wrappedCallback
+        );
+        return this;
+    };
+
+    /**
+     * @callback Database~UpdateHookCallback
+     * @param {'insert'|'update'|'delete'} operation
+     * - The type of change that occurred
+     * @param {string} database
+     * - The name of the database where the change occurred
+     * @param {string} table
+     * - The name of the database's table where the change occurred
+     * @param {number} rowId
+     * - The [rowid](https://www.sqlite.org/rowidtable.html) of the changed row
+     */
 
     // export Database to Module
     Module.Database = Database;
